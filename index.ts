@@ -1,4 +1,4 @@
-import axios, { AxiosResponse } from "axios";
+
 
 // 自定義錯誤類別
 export class YouTubeAPIError extends Error {
@@ -51,10 +51,6 @@ export class ErrorHandler {
 
     if (error instanceof YouTubeAPIError) {
       youtubeError = error;
-    } else if (axios.isAxiosError(error)) {
-      const statusCode = error.response?.status;
-      const message = this.getErrorMessage(code, context, error.message);
-      youtubeError = new YouTubeAPIError(message, code, statusCode, error);
     } else {
       const message = this.getErrorMessage(code, context, error?.message || error?.toString() || '未知錯誤');
       youtubeError = new YouTubeAPIError(message, code, undefined, error);
@@ -95,6 +91,7 @@ export class ErrorHandler {
 // 全域錯誤處理器實例
 const errorHandler = ErrorHandler.getInstance();
 
+const USER_AGENT = 'ysa-v2.0.2';
 const youtubeEndpoint = `https://www.youtube.com`;
 
 interface YoutubeInitData {
@@ -105,7 +102,7 @@ interface YoutubeInitData {
 
 interface YoutubePlayerDetail {
   videoId: string;
-  thumbnail: any;
+  thumbnails: any;
   author?: string;
   channelId: string;
   shortDescription: string;
@@ -115,7 +112,7 @@ interface YoutubePlayerDetail {
 export interface SearchItem {
   id: string;
   type: string;
-  thumbnail: any;
+  thumbnails: any;
   title: string;
   channelTitle?: string;
   shortBylineText?: string;
@@ -146,7 +143,7 @@ export interface ChannelResult {
 export interface VideoDetails {
   id: string;
   title: string;
-  thumbnail: any;
+  thumbnails: any[];
   isLive: boolean;
   channel: string;
   channelId: string;
@@ -158,7 +155,7 @@ export interface VideoDetails {
 export interface ShortVideo {
   id: string;
   type: string;
-  thumbnail: any;
+  thumbnails: any;
   title: string;
   inlinePlaybackEndpoint: any;
 }
@@ -167,18 +164,148 @@ interface SearchOptions {
   type: string;
 }
 
-const GetYoutubeInitData = async (url: string): Promise<YoutubeInitData> => {
+interface Thumbnail {
+  url: string;
+  width: number;
+  height: number;
+}
+
+interface PlaylistItem {
+  id: string;
+  title: string;
+  contentType: string;
+  thumbnails: Thumbnail[];
+  firstVideoId: string | null;
+  videoCount: string | null;
+}
+
+function extractPlaylists(sectionListRenderer: any[]): PlaylistItem[] {
+  const playlists: PlaylistItem[] = [];
+
+  sectionListRenderer.forEach((section: any) => {
+    if (section.itemSectionRenderer) {
+      section.itemSectionRenderer.contents.forEach((item: any) => {
+        if (item.lockupViewModel) {
+          const lockup = item.lockupViewModel;
+          const contentId = lockup.contentId;
+          const contentType = lockup.contentType;
+          const title = lockup.metadata?.lockupMetadataViewModel?.title?.content;
+          
+          // Get all thumbnails from sources
+          const thumbnailSources = lockup.contentImage?.collectionThumbnailViewModel?.primaryThumbnail?.thumbnailViewModel?.image?.sources || [];
+          const thumbnails = thumbnailSources.map((source: any) => ({
+            url: source.url,
+            width: source.width,
+            height: source.height
+          }));
+
+          // Get first video ID from itemPlayback
+          const firstVideoId = lockup.itemPlayback?.inlinePlayerData?.onSelect?.innertubeCommand?.watchEndpoint?.videoId || null;
+
+          // Get video count from thumbnail badge (e.g., "29 video", "145 episode")
+          const thumbnailBadges = lockup.contentImage?.collectionThumbnailViewModel?.primaryThumbnail?.thumbnailViewModel?.overlays?.[0]?.thumbnailOverlayBadgeViewModel?.thumbnailBadges || [];
+          const videoCount = thumbnailBadges[0]?.thumbnailBadgeViewModel?.text || null;
+
+          // Only include playlists and podcasts (podcasts are also playlists on YouTube)
+          if (
+            (contentType === 'LOCKUP_CONTENT_TYPE_PLAYLIST' || 
+             contentType === 'LOCKUP_CONTENT_TYPE_PODCAST') &&
+            contentId &&
+            title
+          ) {
+            playlists.push({
+              id: contentId,
+              title: title,
+              contentType: contentType,
+              thumbnails: thumbnails,
+              firstVideoId: firstVideoId,
+              videoCount: videoCount
+            });
+          }
+        }
+      });
+    }
+  });
+
+  return playlists;
+}
+
+function extractPlaylistVideos(data: any): VideoDetails[] {
+  const videos: VideoDetails[] = [];
+
+  try {
+    const contents = data.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents;
+
+    if (!contents) {
+      return videos;
+    }
+
+    contents.forEach((item: any) => {
+      if (item.playlistVideoRenderer) {
+        const video = item.playlistVideoRenderer;
+
+        // Skip continuation items
+        if (!video.videoId) {
+          return;
+        }
+
+        videos.push({
+          id: video.videoId,
+          title: video.title?.runs?.[0]?.text || video.title?.simpleText || '',
+          thumbnails: video.thumbnail?.thumbnails || [],
+          isLive: false,
+          channel: video.shortBylineText?.runs?.[0]?.text || '',
+          channelId: video.shortBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId || '',
+          description: '',
+          keywords: [],
+          suggestion: []
+        });
+      }
+    });
+
+    return videos;
+  } catch (error) {
+    console.error('Error extracting playlist videos:', error);
+    return videos;
+  }
+}
+
+export const GetPlaylistDetails = async (playlistId: string) => {
+
+  const page = await GetYoutubeInitData(`${youtubeEndpoint}/playlist?list=${playlistId}`);
+
+  const sectionListRenderer = page.initdata.contents.twoColumnBrowseResultsRenderer.tabs[0].tabRenderer.content
+    .sectionListRenderer
+
+  const videos = extractPlaylistVideos(sectionListRenderer);
+
+  return videos;
+}
+
+export const GetYoutubeInitData = async (url: string): Promise<YoutubeInitData> => {
   let initdata: any = {};
   let apiToken: string | null = null;
   let context: any = null;
   try {
-    const page: AxiosResponse<string> = await axios.get(encodeURI(url));
-    const ytInitData = page.data.split("var ytInitialData =");
+    const response = await fetch(encodeURI(url), {
+      method: 'GET',
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Origin': 'https://www.youtube.com',
+      },
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    const text = await response.text();
+    const ytInitData = text.split("var ytInitialData =");
     if (ytInitData && ytInitData.length > 1) {
       const data = ytInitData[1].split("</script>")[0].slice(0, -1);
 
-      if (page.data.split("innertubeApiKey").length > 1) {
-        const apiKeyPart = page.data.split("innertubeApiKey")[1];
+      if (text.split("innertubeApiKey").length > 1) {
+        const apiKeyPart = text.split("innertubeApiKey")[1];
         if (apiKeyPart) {
           apiToken = apiKeyPart
             .trim()
@@ -187,8 +314,8 @@ const GetYoutubeInitData = async (url: string): Promise<YoutubeInitData> => {
         }
       }
 
-      if (page.data.split("INNERTUBE_CONTEXT").length > 1) {
-        const contextPart = page.data.split("INNERTUBE_CONTEXT")[1];
+      if (text.split("INNERTUBE_CONTEXT").length > 1) {
+        const contextPart = text.split("INNERTUBE_CONTEXT")[1];
         if (contextPart) {
           context = JSON.parse(
             contextPart.trim().slice(2, -2)
@@ -222,8 +349,20 @@ const GetYoutubePlayerDetail = async (
 ): Promise<YoutubePlayerDetail> => {
   let initdata: any = {};
   try {
-    const page: AxiosResponse<string> = await axios.get(encodeURI(url));
-    const ytInitData = page.data.split("var ytInitialPlayerResponse =");
+    const response = await fetch(encodeURI(url), {
+      method: 'GET',
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Origin': 'https://www.youtube.com',
+      },
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    const text = await response.text();
+    const ytInitData = text.split("var ytInitialPlayerResponse =");
     if (ytInitData && ytInitData.length > 1) {
       const data = ytInitData[1].split("</script>")[0].slice(0, -1);
       initdata = JSON.parse(data);
@@ -253,7 +392,7 @@ const GetData = async (
   limit: number = 0,
   options: SearchOptions[] = []
 ): Promise<SearchResult> => {
-  let endpoint = `${youtubeEndpoint}/results?search_query=${keyword}`;
+  let endpoint = `${youtubeEndpoint}/results?search_query=${encodeURIComponent(keyword)}`;
   try {
     if (Array.isArray(options) && options.length > 0) {
       const type = options.find((z) => z.type);
@@ -284,6 +423,14 @@ const GetData = async (
 
     let items: SearchItem[] = [];
 
+    //write sectionListRenderer.contents to local json
+    
+    // fs.writeFileSync('sectionListRenderer.json', JSON.stringify(sectionListRenderer.contents, null, 2));
+
+    // Extract playlists using the new format
+    let extractedPlaylists: PlaylistItem[] | null = null;
+    if (withPlaylist) extractedPlaylists = extractPlaylists(sectionListRenderer.contents);
+
     sectionListRenderer.contents.forEach((content: any) => {
       if (content.continuationItemRenderer) {
         contToken =
@@ -296,34 +443,55 @@ const GetData = async (
             items.push({
               id: channelRenderer.channelId,
               type: "channel",
-              thumbnail: channelRenderer.thumbnail,
+              thumbnails: channelRenderer.thumbnail,
               title: channelRenderer.title.simpleText
             });
           } else {
             let videoRender = item.videoRenderer;
-            let playListRender = item.playlistRenderer;
+            // let playListRender = item.playlistRenderer;
 
             if (videoRender && videoRender.videoId) {
               items.push(VideoRender(item));
             }
-            if (withPlaylist) {
-              if (playListRender && playListRender.playlistId) {
-                items.push({
-                  id: playListRender.playlistId,
-                  type: "playlist",
-                  thumbnail: playListRender.thumbnails,
-                  title: playListRender.title.simpleText,
-                  length: playListRender.videoCount,
-                  videos: playListRender.videos,
-                  videoCount: playListRender.videoCount,
-                  isLive: false
-                });
-              }
-            }
+            // if (withPlaylist) {
+            //   if (playListRender && playListRender.playlistId) {
+            //     items.push({
+            //       id: playListRender.playlistId,
+            //       type: "playlist",
+            //       thumbnail: playListRender.thumbnails,
+            //       title: playListRender.title.simpleText,
+            //       length: playListRender.videoCount,
+            //       videos: playListRender.videos,
+            //       videoCount: playListRender.videoCount,
+            //       isLive: false
+            //     });
+            //   }
+            // }
           }
         });
       }
     });
+    
+    // Add extracted playlists from new format
+    if (withPlaylist  && extractedPlaylists) {
+      extractedPlaylists.forEach(playlist => {
+        // Parse video count from string like "29 video" or "145 episode"
+        const countMatch = playlist.videoCount?.match(/(\d+)/);
+        const videoCount = countMatch ? parseInt(countMatch[1]) : 0;
+        
+        items.push({
+          id: playlist.id,
+          type: "playlist",
+          thumbnails: playlist.thumbnails,
+          title: playlist.title,
+          length: videoCount,
+          videos: [],
+          videoCount: `${videoCount} Videos`,
+          isLive: false
+        });
+      });
+    }
+    
     const apiToken = page.apiToken;
     const context = page.context;
     const nextPageContext = { context, continuation: contToken };
@@ -349,12 +517,23 @@ const nextPage = async (
 ): Promise<SearchResult> => {
   const endpoint = `${youtubeEndpoint}/youtubei/v1/search?key=${nextPage.nextPageToken}`;
   try {
-    const page: AxiosResponse = await axios.post(
-      encodeURI(endpoint),
-      nextPage.nextPageContext
-    );
+    const response = await fetch(encodeURI(endpoint), {
+      method: 'POST',
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Origin': 'https://www.youtube.com',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(nextPage.nextPageContext)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    const data: any = await response.json();
     const item1 =
-      page.data.onResponseReceivedCommands[0].appendContinuationItemsAction;
+      data.onResponseReceivedCommands[0].appendContinuationItemsAction;
     let items: SearchItem[] = [];
     item1.continuationItems.forEach((conitem: any) => {
       if (conitem.itemSectionRenderer) {
@@ -369,7 +548,7 @@ const nextPage = async (
               items.push({
                 id: playListRender.playlistId,
                 type: "playlist",
-                thumbnail: playListRender.thumbnails,
+                thumbnails: playListRender.thumbnails,
                 title: playListRender.title.simpleText,
                 length: playListRender.videoCount,
                 videos: (await GetPlaylistData(playListRender.playlistId))
@@ -504,7 +683,7 @@ const GetVideoDetails = async (videoId: string): Promise<VideoDetails> => {
     const res: VideoDetails = {
       id: playerData.videoId,
       title: firstContent.title.runs[0].text,
-      thumbnail: playerData.thumbnail,
+      thumbnails: playerData.thumbnails || [],
       isLive: firstContent.viewCount.videoViewCountRenderer.hasOwnProperty(
         "isLive"
       )
@@ -554,7 +733,7 @@ export const VideoRender = (json: any): SearchItem => {
         });
       }
       const id = videoRenderer.videoId;
-      const thumbnail = videoRenderer.thumbnail;
+      const thumbnails = videoRenderer.thumbnail;
       const title = videoRenderer.title.runs[0].text;
       const shortBylineText = videoRenderer.shortBylineText
         ? videoRenderer.shortBylineText
@@ -569,7 +748,7 @@ export const VideoRender = (json: any): SearchItem => {
       return {
         id,
         type: "video",
-        thumbnail,
+        thumbnails,
         title,
         channelTitle,
         shortBylineText,
@@ -580,7 +759,7 @@ export const VideoRender = (json: any): SearchItem => {
     return {
       id: "",
       type: "",
-      thumbnail: undefined,
+      thumbnails: undefined,
       title: ""
     };
   } catch (ex) {
@@ -603,7 +782,7 @@ const compactVideoRenderer = (json: any): SearchItem => {
   return {
     id: compactVideoRendererJson.videoId,
     type: "video",
-    thumbnail: compactVideoRendererJson.thumbnail.thumbnails,
+    thumbnails: compactVideoRendererJson.thumbnail.thumbnails,
     title: compactVideoRendererJson.title.simpleText,
     channelTitle: compactVideoRendererJson.shortBylineText.runs[0].text,
     shortBylineText: compactVideoRendererJson.shortBylineText.runs[0].text,
@@ -627,7 +806,7 @@ const GetShortVideo = async (): Promise<ShortVideo[]> => {
   return res.map((json: any) => ({
     id: json.videoId,
     type: "reel",
-    thumbnail: json.thumbnail.thumbnails[0],
+    thumbnails: json.thumbnail.thumbnails[0],
     title: json.headline.simpleText,
     inlinePlaybackEndpoint: json.inlinePlaybackEndpoint || {}
   }));
