@@ -42,9 +42,6 @@
     "README.md",
     "LICENSE"
   ],
-  "dependencies": {
-    "axios": "^1.9.0"
-  },
   "devDependencies": {
     "typescript": "^5.5.4",
     "@types/node": "^20.14.10",
