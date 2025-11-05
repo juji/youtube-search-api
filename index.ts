@@ -91,7 +91,7 @@ export class ErrorHandler {
 // 全域錯誤處理器實例
 const errorHandler = ErrorHandler.getInstance();
 
-const USER_AGENT = 'ysa-v2.0.2';
+const USER_AGENT = 'ysa-v3.0.0';
 const youtubeEndpoint = `https://www.youtube.com`;
 
 interface YoutubeInitData {
